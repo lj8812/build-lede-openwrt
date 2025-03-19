@@ -1,0 +1,76 @@
+name: Compatibility Check
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 每天UTC时间0点自动触发
+  workflow_dispatch:      # 支持手动触发
+
+jobs:
+  compatibility-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout firmware (LEDE)
+      uses: actions/checkout@v4
+      with:
+        repository: coolsnowwolf/lede
+        path: lede
+        ref: master  # 明确指定固件分支
+
+    - name: Checkout plugin (macfilter)
+      uses: actions/checkout@v4
+      with:
+        repository: lj8812/luci-app-macfilter
+        path: plugin
+        ref: main    # 明确指定插件分支
+
+    - name: Inject plugin to firmware
+      run: |
+        # 创建插件目录并复制代码
+        mkdir -p lede/package/luci-app-macfilter
+        cp -r plugin/* lede/package/luci-app-macfilter/
+
+        # 验证注入结果
+        ls -l lede/package/luci-app-macfilter/
+
+    - name: Setup Build Environment
+      run: |
+        sudo apt update
+        sudo apt install -y build-essential ccache
+
+    - name: Run Precompile Check
+      working-directory: ./lede
+      run: |
+        # 初始化编译环境
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        make defconfig
+
+        # 生成日志目录并编译
+        mkdir -p logs
+        make package/luci-app-macfilter/compile V=s -j2 2>&1 | tee logs/build.log
+
+        # 检测错误关键词
+        if grep -E "ERROR:|Error [0-9]{1,}" logs/build.log; then
+          echo "::error::检测到编译冲突！"
+          exit 1
+        fi
+
+    - name: Upload Build Logs
+      if: failure()
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-logs
+        path: lede/logs/
+
+    - name: Notify Failure
+      if: failure()
+      uses: actions/github-script@v6
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `⚠️ 固件与插件冲突检测失败！\n下载日志：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`
+          })
