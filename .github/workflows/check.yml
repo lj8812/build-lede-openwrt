@@ -1,79 +1,127 @@
-name: Compatibility Check
+name: Compatibility Check with Auto Report
 
 on:
   schedule:
-    - cron: '0 0 * * *'  # 每天UTC时间0点自动触发
+    - cron: '0 0 * * *'  # 每日UTC午夜自动执行
   workflow_dispatch:      # 支持手动触发
 
 jobs:
-  compatibility-test:
+  compatibility-check:
+    name: Check Firmware-Plugin Conflicts
     runs-on: ubuntu-latest
+    timeout-minutes: 45   # 设置超时时间
 
     steps:
-    - name: Checkout firmware (LEDE)
+    # ================= 代码检出阶段 =================
+    - name: Checkout LEDE firmware
       uses: actions/checkout@v4
       with:
         repository: coolsnowwolf/lede
         path: lede
-        ref: master  # 明确指定固件分支
+        ref: master
+        fetch-depth: 1    # 浅克隆加速
 
-    - name: Checkout plugin (macfilter)
+    - name: Checkout macfilter plugin
       uses: actions/checkout@v4
       with:
         repository: lj8812/luci-app-macfilter
         path: plugin
-        ref: main    # 明确指定插件分支
+        ref: main
+        fetch-depth: 1
 
-    - name: Inject plugin to firmware
+    # ================= 插件注入阶段 =================
+    - name: Inject plugin to build system
       run: |
-        # 创建插件目录并复制代码
-        mkdir -p lede/package/luci-app-macfilter
-        cp -r plugin/* lede/package/luci-app-macfilter/
+        # 创建插件目录并保持结构兼容
+        mkdir -p lede/package/network/services/luci-app-macfilter
+        cp -r plugin/{files,src,Makefile} lede/package/network/services/luci-app-macfilter/
+        
+        # 验证目录结构
+        tree -L 3 lede/package/network/services
 
-        # 验证注入结果
-        ls -l lede/package/luci-app-macfilter/
-
-    - name: Setup Build Environment
+    # ================= 环境准备阶段 =================
+    - name: Setup build environment
       run: |
         sudo apt update
-        sudo apt install -y build-essential ccache
+        sudo apt install -y \
+          build-essential \
+          ccache \
+          libncurses-dev \
+          unzip
 
-    - name: Run Precompile Check
+    # ================= 编译检测阶段 =================
+    - name: Run compatibility check
       working-directory: ./lede
+      env:
+        CCACHE_DIR: /tmp/ccache  # 启用编译缓存
       run: |
-        # 初始化编译环境
+        # 初始化编译系统
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         make defconfig
 
-        # 生成日志目录并编译
+        # 创建日志目录
         mkdir -p logs
-        make package/luci-app-macfilter/compile V=s -j2 2>&1 | tee logs/build.log
 
-        # 检测错误关键词
-        if grep -E "ERROR:|Error [0-9]{1,}" logs/build.log; then
-          echo "::error::检测到编译冲突！"
-          exit 1
+        # 执行针对性编译并捕获日志
+        set -o pipefail
+        make package/network/services/luci-app-macfilter/compile \
+          V=s \
+          -j$(($(nproc) * 2)) 2>&1 | tee logs/build.log
+
+    # ================= 报告生成阶段 =================
+    - name: Generate conflict report
+      working-directory: ./lede
+      if: ${{ always() }}  # 总是执行以生成报告
+      run: |
+        # 创建标记文件
+        echo "# Conflict Report" > conflict-report.md
+        date -u +"**检测时间**: %Y-%m-%d %H:%M UTC" >> conflict-report.md
+
+        # 错误摘要
+        echo "## 错误摘要" >> conflict-report.md
+        {
+          grep -nHE "ERROR:|error:|multiple definition" logs/build.log || true
+        } | sed 's/^/    /' >> conflict-report.md
+
+        # 智能修复建议
+        echo "## 自动修复建议" >> conflict-report.md
+        
+        # 符号冲突检测
+        if grep -q "multiple definition" logs/build.log; then
+          conflict_symbols=$(grep -oP "multiple definition of '\K[^']+" logs/build.log | sort -u)
+          for sym in $conflict_symbols; do
+            new_sym="${sym}_$(date +%s | tail -c 3)"
+            echo "- ​**符号冲突**: \`${sym}\` → \`${new_sym}\`" >> conflict-report.md
+            echo "  影响文件: \`$(grep -rlw "$sym" package/network/services/luci-app-macfilter/)\`" >> conflict-report.md
+          done
         fi
 
-    - name: Upload Build Logs
-      if: failure()
+        # 头文件缺失检测
+        if grep -q "No such file or directory" logs/build.log; then
+          missing_headers=$(grep -oP "No such file or directory.*'\K[^']+" logs/build.log | sort -u)
+          for header in $missing_headers; do
+            echo "- ​**文件缺失**: 需要 \`$header\`" >> conflict-report.md
+            echo "  可能解决方案:" >> conflict-report.md
+            echo "  1. 将文件放置到 \`package/network/services/luci-app-macfilter/files/${header}\`" >> conflict-report.md
+            echo "  2. 修改 Makefile 包含路径" >> conflict-report.md
+          done
+        fi
+
+        # 依赖缺失检测
+        if grep -q "missing dependencies" logs/build.log; then
+          deps=$(grep -oP "missing dependencies.*\K\S+" logs/build.log | tr ',' '\n')
+          echo "- ​**依赖缺失**: 需要添加以下依赖：" >> conflict-report.md
+          echo "  \`$(echo $deps | tr '\n' ' ')\`" >> conflict-report.md
+        fi
+
+    # ================= 结果归档阶段 =================
+    - name: Archive artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: build-logs
-        path: lede/logs/
-
-    - name: Notify Failure
-      if: failure()
-      uses: actions/github-script@v7
-      with:
-        script: |
-          github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: `⚠️ 固件与插件冲突检测失败！\n下载日志：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`
-          })
-            repo: context.repo.repo,
-            body: `⚠️ 固件与插件冲突检测失败！\n下载日志：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`
-          })
+        name: conflict-reports-${{ github.run_id }}-$(date +%s)
+        path: |
+          lede/logs/build.log
+          lede/conflict-report.md
+          lede/package/network/services/luci-app-macfilter/Makefile
+        retention-days: 7  # 自动清理旧报告
