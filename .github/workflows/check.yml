@@ -1,127 +1,164 @@
-name: Compatibility Check with Auto Report
+name: OpenWrt Plugin Compatibility Check
 
 on:
+  workflow_dispatch: # 手动触发
   schedule:
     - cron: '0 0 * * *'  # 每日UTC午夜自动执行
-  workflow_dispatch:      # 支持手动触发
 
 jobs:
   compatibility-check:
-    name: Check Firmware-Plugin Conflicts
     runs-on: ubuntu-latest
-    timeout-minutes: 45   # 设置超时时间
+    timeout-minutes: 60
 
     steps:
-    # ================= 代码检出阶段 =================
+    # ================== 检出代码 ==================
     - name: Checkout LEDE firmware
       uses: actions/checkout@v4
       with:
         repository: coolsnowwolf/lede
         path: lede
         ref: master
-        fetch-depth: 1    # 浅克隆加速
+        fetch-depth: 1
 
     - name: Checkout macfilter plugin
       uses: actions/checkout@v4
       with:
         repository: lj8812/luci-app-macfilter
         path: plugin
-        ref: main
+        ref: master  # 确认分支正确
         fetch-depth: 1
 
-    # ================= 插件注入阶段 =================
-    - name: Inject plugin to build system
+    # ================= 注入插件 =================
+    - name: Inject plugin files
       run: |
-        # 创建插件目录并保持结构兼容
-        mkdir -p lede/package/network/services/luci-app-macfilter
-        cp -r plugin/{files,src,Makefile} lede/package/network/services/luci-app-macfilter/
-        
-        # 验证目录结构
-        tree -L 3 lede/package/network/services
+        # 创建目标目录结构
+        PLUGIN_DEST="lede/package/network/services/luci-app-macfilter"
+        mkdir -p $PLUGIN_DEST/{luasrc,root/files}
 
-    # ================= 环境准备阶段 =================
+        # 复制核心组件
+        cp -r plugin/luasrc/* $PLUGIN_DEST/luasrc/
+        cp -r plugin/root/* $PLUGIN_DEST/root/
+
+        # 生成标准 Makefile
+        cat > $PLUGIN_DEST/Makefile << 'EOF'
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=luci-app-macfilter
+PKG_VERSION:=1.2.0
+PKG_RELEASE:=1
+
+LUCI_TITLE:=MAC Filter Management Interface
+LUCI_DEPENDS:=+luci-base +kmod-mac-filter
+LUCI_PKGARCH:=all
+
+define Package/$(PKG_NAME)/config
+config LUCI_APP_MACFILTER_INCLUDE_UI
+    bool "Include Web Interface"
+    default y
+endef
+
+include $(TOPDIR)/feeds/luci/luci.mk
+
+# call BuildPackage - OpenWrt buildroot signature
+EOF
+
+        # 验证关键文件存在
+        REQUIRED_FILES=(
+          "$PLUGIN_DEST/luasrc/model/cbi/macfilter.lua"
+          "$PLUGIN_DEST/root/etc/init.d/macfilter"
+        )
+        for file in "${REQUIRED_FILES[@]}"; do
+          if [ ! -f "$file" ]; then
+            echo "::error::Missing critical file: ${file/$PLUGIN_DEST\//}"
+            exit 1
+          fi
+        done
+
+        # 打印注入后的目录树
+        tree -L 4 $PLUGIN_DEST
+
+    # ================== 编译环境 ==================
     - name: Setup build environment
       run: |
         sudo apt update
         sudo apt install -y \
           build-essential \
           ccache \
-          libncurses-dev \
-          unzip
+          libncurses5-dev \
+          zlib1g-dev
 
-    # ================= 编译检测阶段 =================
+    # ================== 编译检测 ==================
     - name: Run compatibility check
       working-directory: ./lede
       env:
-        CCACHE_DIR: /tmp/ccache  # 启用编译缓存
+        CCACHE_DIR: /tmp/ccache
+        CCACHE_MAXSIZE: 2G
       run: |
         # 初始化编译系统
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         make defconfig
 
-        # 创建日志目录
+        # 创建日志目录并编译
         mkdir -p logs
-
-        # 执行针对性编译并捕获日志
         set -o pipefail
-        make package/network/services/luci-app-macfilter/compile \
-          V=s \
-          -j$(($(nproc) * 2)) 2>&1 | tee logs/build.log
+        make package/network/services/luci-app-macfilter/{clean,compile} \
+          V=sc \
+          -j$(($(nproc) + 1)) 2>&1 | tee logs/build.log
 
-    # ================= 报告生成阶段 =================
+        # 验证生成IPK文件
+        if ! ls bin/packages/*/luci/luci-app-macfilter*.ipk; then
+          echo "::error::Failed to generate IPK package"
+          exit 1
+        fi
+
+    # ================== 报告生成 ==================
     - name: Generate conflict report
+      if: always()
       working-directory: ./lede
-      if: ${{ always() }}  # 总是执行以生成报告
       run: |
-        # 创建标记文件
-        echo "# Conflict Report" > conflict-report.md
-        date -u +"**检测时间**: %Y-%m-%d %H:%M UTC" >> conflict-report.md
+        # 初始化报告文件
+        REPORT_FILE="conflict-report.md"
+        echo "# OpenWrt Plugin Compatibility Report" > $REPORT_FILE
+        echo "**Generated at**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $REPORT_FILE
 
         # 错误摘要
-        echo "## 错误摘要" >> conflict-report.md
-        {
-          grep -nHE "ERROR:|error:|multiple definition" logs/build.log || true
-        } | sed 's/^/    /' >> conflict-report.md
+        echo "## Build Error Summary" >> $REPORT_FILE
+        grep --color=never -Ein "error:|warning:" logs/build.log | \
+          sed 's/^/    /' >> $REPORT_FILE
 
         # 智能修复建议
-        echo "## 自动修复建议" >> conflict-report.md
-        
-        # 符号冲突检测
+        echo "## Suggested Fixes" >> $REPORT_FILE
+
+        # 符号冲突修复
         if grep -q "multiple definition" logs/build.log; then
-          conflict_symbols=$(grep -oP "multiple definition of '\K[^']+" logs/build.log | sort -u)
-          for sym in $conflict_symbols; do
-            new_sym="${sym}_$(date +%s | tail -c 3)"
-            echo "- ​**符号冲突**: \`${sym}\` → \`${new_sym}\`" >> conflict-report.md
-            echo "  影响文件: \`$(grep -rlw "$sym" package/network/services/luci-app-macfilter/)\`" >> conflict-report.md
+          echo "### Symbol Conflicts" >> $REPORT_FILE
+          grep -oP "multiple definition of '\K[^']+" logs/build.log | sort -u | while read sym; do
+            new_sym="${sym}_macfilter_$(date +%s | tail -c 3)"
+            echo "- Rename \`$sym\` to \`$new_sym\` in:" >> $REPORT_FILE
+            grep -rlw "$sym" package/network/services/luci-app-macfilter/ | \
+              sed 's/^/  - `/;s/$/`/' >> $REPORT_FILE
           done
         fi
 
-        # 头文件缺失检测
-        if grep -q "No such file or directory" logs/build.log; then
-          missing_headers=$(grep -oP "No such file or directory.*'\K[^']+" logs/build.log | sort -u)
-          for header in $missing_headers; do
-            echo "- ​**文件缺失**: 需要 \`$header\`" >> conflict-report.md
-            echo "  可能解决方案:" >> conflict-report.md
-            echo "  1. 将文件放置到 \`package/network/services/luci-app-macfilter/files/${header}\`" >> conflict-report.md
-            echo "  2. 修改 Makefile 包含路径" >> conflict-report.md
+        # 路径缺失修复
+        if grep -q "No such file" logs/build.log; then
+          echo "### Missing Files" >> $REPORT_FILE
+          grep -oP "No such file or directory.*'\K[^']+" logs/build.log | sort -u | while read f; do
+            echo "- Required file: \`$f\`" >> $REPORT_FILE
+            echo "  Possible locations:" >> $REPORT_FILE
+            echo "  1. \`package/network/services/luci-app-macfilter/root/$f\`" >> $REPORT_FILE
+            echo "  2. \`package/network/services/luci-app-macfilter/files/$f\`" >> $REPORT_FILE
           done
         fi
 
-        # 依赖缺失检测
-        if grep -q "missing dependencies" logs/build.log; then
-          deps=$(grep -oP "missing dependencies.*\K\S+" logs/build.log | tr ',' '\n')
-          echo "- ​**依赖缺失**: 需要添加以下依赖：" >> conflict-report.md
-          echo "  \`$(echo $deps | tr '\n' ' ')\`" >> conflict-report.md
-        fi
-
-    # ================= 结果归档阶段 =================
-    - name: Archive artifacts
+    # ================== 结果归档 ==================
+    - name: Archive build artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: conflict-reports-${{ github.run_id }}-$(date +%s)
+        name: openwrt-build-reports-${{ github.run_id }}
         path: |
           lede/logs/build.log
           lede/conflict-report.md
-          lede/package/network/services/luci-app-macfilter/Makefile
-        retention-days: 7  # 自动清理旧报告
+          lede/bin/packages/*/luci/luci-app-macfilter*.ipk
+        retention-days: 3
