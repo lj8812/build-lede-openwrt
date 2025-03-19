@@ -20,13 +20,21 @@ jobs:
         ref: master
         fetch-depth: 1
 
+    # ================== 检出插件 ==================
     - name: Checkout macfilter plugin
       uses: actions/checkout@v4
       with:
         repository: lj8812/luci-app-macfilter
         path: plugin
-        ref: master  # 确认分支正确
-        fetch-depth: 1
+        # 修正1：使用正确的分支名称
+        ref: main  # 或移除此参数以使用仓库默认分支
+        # 修正2：增加调试信息
+        fetch-depth: 0  # 获取完整历史用于诊断
+    - name: Debug plugin branch
+      run: |
+        cd plugin
+        git branch -a
+        git log -1 --oneline
 
     # ================= 注入插件 =================
     - name: Inject plugin files
