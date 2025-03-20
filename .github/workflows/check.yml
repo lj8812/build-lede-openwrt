@@ -25,19 +25,21 @@ jobs:
 
     steps:
     # ================== 环境初始化 ==================
-    - name: 检出 OpenWrt 源码
+    # ================== 源码准备 ==================
+    - name: Checkout LEDE firmware
       uses: actions/checkout@v4
       with:
         repository: coolsnowwolf/lede
         path: lede
         submodules: recursive
 
-    - name: 检出插件源码
+    - name: Checkout plugin
       uses: actions/checkout@v4
       with:
-        repository: ${{ github.event.inputs.plugin_repo }}
+        repository: lj8812/luci-app-macfilter  # 正确格式
         path: plugin
         ref: master
+        fetch-depth: 0  # 获取完整历史（可选）
 
     # ================== 预检阶段 ==================
     - name: 插件完整性验证
