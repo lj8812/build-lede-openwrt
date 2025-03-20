@@ -24,7 +24,6 @@ jobs:
       PLUGIN_PATH: "network/services/luci-app-macfilter"
 
     steps:
-    # ================== 环境初始化 ==================
     # ================== 源码准备 ==================
     - name: Checkout LEDE firmware
       uses: actions/checkout@v4
@@ -36,10 +35,22 @@ jobs:
     - name: Checkout plugin
       uses: actions/checkout@v4
       with:
-        repository: lj8812/luci-app-macfilter  # 正确格式
+        repository: lj8812/luci-app-macfilter
         path: plugin
-        ref: master
-        fetch-depth: 0  # 获取完整历史（可选）
+        ref: main  # 使用实际存在的分支名
+        # 如果仓库是私有仓库需添加：
+        # token: ${{ secrets.ACCESS_TOKEN }}
+
+    # ================== 分支验证 (新增步骤) ==================
+    - name: Validate plugin branch
+      run: |
+        cd plugin
+        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        echo "当前分支: $CURRENT_BRANCH"
+        if [ "$CURRENT_BRANCH" != "main" ]; then
+          echo "::error::分支验证失败，期望分支：main，实际分支：$CURRENT_BRANCH"
+          exit 1
+        fi
 
     # ================== 预检阶段 ==================
     - name: 插件完整性验证
