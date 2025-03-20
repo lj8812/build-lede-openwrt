@@ -102,12 +102,20 @@ jobs:
           ccache ecj fastjar file
 
     # ================== 预处理步骤 ==================
+    # ================== 预处理步骤 ==================
     - name: 清理编译缓存
       working-directory: ./lede
       run: |
+        # 安全清理编译产物
         make distclean || true
-        rm -rf ./tmp ./feeds ./staging_dir
-        git checkout .config
+        rm -rf \
+          ./tmp \
+          ./feeds \
+          ./staging_dir \
+          ./bin
+        
+        # 保留.config以便复用配置
+        echo "保留现有.config文件"
 
     # ================== 编译执行 ==================
     - name: 执行插件编译
