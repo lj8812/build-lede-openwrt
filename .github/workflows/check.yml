@@ -76,7 +76,8 @@ jobs:
           git \
           libncurses5-dev \
           libssl-dev \
-          python3-distutils \
+          python3-dev \          # 替换 python3-distutils
+          python3-lib2to3 \      # 新增替代包
           rsync \
           unzip \
           zlib1g-dev \
