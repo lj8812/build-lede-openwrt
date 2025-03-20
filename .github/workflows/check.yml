@@ -1,9 +1,20 @@
-name: OpenWrt Compatibility Check
+name: OpenWrt Plugin Compatibility Builder
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * *' 
+    inputs:
+      target:
+        description: '目标平台（格式：架构/子架构）'
+        required: true
+        default: 'x86/64'
+      firmware_version:
+        description: 'OpenWrt 版本号'
+        required: true
+        default: '23.05.5'
+      plugin_repo:
+        description: '插件源码仓库地址'
+        required: true
+        default: 'https://github.com/lj8812/luci-app-macfilter.git'
 
 jobs:
   compatibility-check:
@@ -13,22 +24,23 @@ jobs:
       PLUGIN_PATH: "network/services/luci-app-macfilter"
 
     steps:
-    # ================== 源码准备 ==================
-    - name: Checkout LEDE firmware
+    # ================== 环境初始化 ==================
+    - name: 检出 OpenWrt 源码
       uses: actions/checkout@v4
       with:
         repository: coolsnowwolf/lede
         path: lede
         submodules: recursive
 
-    - name: Checkout plugin
+    - name: 检出插件源码
       uses: actions/checkout@v4
       with:
-        repository: lj8812/luci-app-macfilter
+        repository: ${{ github.event.inputs.plugin_repo }}
         path: plugin
+        ref: master
 
-    # ================== 冲突预检 ==================
-    - name: Pre-check conflicts
+    # ================== 预检阶段 ==================
+    - name: 插件完整性验证
       run: |
         REQUIRED_FILES=(
           "plugin/luasrc/controller/macfilter.lua"
@@ -36,64 +48,57 @@ jobs:
         )
         for file in "${REQUIRED_FILES[@]}"; do
           if [ ! -f "$file" ]; then
-            echo "::error::Missing plugin file: $file"
+            echo "::error::缺失关键文件: $file"
             exit 1
           fi
         done
 
-        if ! grep -q '^include .*/rules\.mk' plugin/Makefile; then
-          echo "::error::Makefile missing include rules.mk"
-          exit 1
-        fi
-        if ! grep -q '^LUCI_DEPENDS' plugin/Makefile; then
-          echo "::error::Makefile missing LUCI_DEPENDS"
-          exit 1
-        fi
-        if ! grep -q '^LUCI_TITLE' plugin/Makefile; then
-          echo "::error::Makefile missing LUCI_TITLE"
-          exit 1
-        fi
+        MAKE_VALIDATIONS=(
+          "^include .*/rules\.mk"
+          "^LUCI_DEPENDS"
+          "^LUCI_TITLE"
+        )
+        for pattern in "${MAKE_VALIDATIONS[@]}"; do
+          if ! grep -q "$pattern" plugin/Makefile; then
+            echo "::error::Makefile 缺少必要定义: $pattern"
+            exit 1
+          fi
+        done
 
-    # ================== 注入插件 ==================
-    - name: Integrate plugin
+    # ================== 插件集成 ================== 
+    - name: 注入插件到编译系统
       run: |
         mkdir -p lede/package/$PLUGIN_PATH
         cp -r plugin/* lede/package/$PLUGIN_PATH/
-        find lede/package/$PLUGIN_PATH -type f -exec sed -i 's/\/etc\/config\/MacFilter/\/etc\/config\/macfilter/g' {} +
+        
+        # 统一配置文件路径大小写
+        find lede/package/$PLUGIN_PATH -type f -exec sed -i \
+          's/\/etc\/config\/MacFilter/\/etc\/config\/macfilter/g' {} +
 
-    # ================== 编译环境 ==================
-    - name: Setup build environment
+    # ================== 编译环境配置 ==================
+    - name: 配置 Ubuntu 编译环境
       run: |
         sudo apt update
-        # 安装仓库管理工具
         sudo apt install -y software-properties-common
-        # 启用必要仓库
         sudo add-apt-repository universe -y
         sudo add-apt-repository multiverse -y
-        # 更新仓库
         sudo apt update
-        # 安装编译依赖
+        
         sudo apt install -y \
-          build-essential \
-          clang \
-          flex \
-          g++ \
-          gawk \
-          gcc-multilib \
-          gettext \
-          git \
-          libncurses-dev \      # 更通用的包名
-          libssl-dev \
-          python3-dev \
-          python3-lib2to3 \    # 依赖 universe 仓库
-          rsync \
-          unzip \
-          zlib1g-dev \
-          libdeflate0-dev      # 修正后的包名
+          build-essential clang flex g++ gawk \
+          gcc-multilib gettext git libncurses-dev \
+          libssl-dev python3-dev python3-lib2to3 \
+          rsync unzip zlib1g-dev libdeflate0-dev \
+          ccache ecj fastjar file java-propose-classpath
 
-    # ================== 编译检测 ==================
-    - name: Build plugin
+        # 配置 Python 软链接
+        sudo ln -sf /usr/bin/python3 /usr/bin/python
+
+    # ================== 编译执行 ==================
+    - name: 执行插件编译
       working-directory: ./lede
+      env:
+        CCACHE_DIR: /tmp/ccache
       run: |
         ./scripts/feeds update -a
         ./scripts/feeds install -a
@@ -102,44 +107,60 @@ jobs:
         mkdir -p logs
         set -o pipefail
 
+        # 清理并编译
         make package/$PLUGIN_PATH/clean || true
-        if ! make package/$PLUGIN_PATH/compile V=sc -j$(nproc) 2>&1 | tee logs/build.log; then
-          echo "::error::Build failed with exit code $?"
+        if ! make package/$PLUGIN_PATH/compile \
+          V=sc \
+          -j$(($(nproc) + 1)) 2>&1 | tee logs/build.log
+        then
+          echo "::error::编译失败，错误码: $?"
+          
+          # 提取关键错误信息
+          ERROR_CONTEXT=$(grep -iB 3 "error:" logs/build.log | tail -n 20)
+          echo "::group::错误上下文"
+          echo "$ERROR_CONTEXT"
+          echo "::endgroup::"
+          
           exit 1
         fi
 
-        if [ ! -f bin/packages/*/luci/luci-app-macfilter*.ipk ]; then
-          echo "::error::No IPK package generated"
+        # 验证产出文件
+        if [ -z "$(find bin/packages -name 'luci-app-macfilter*.ipk')" ]; then
+          echo "::error::未生成 IPK 文件"
           exit 1
         fi
 
-    # ================== 智能报告 ==================
-    - name: Generate report
+    # ================== 生成报告 ==================
+    - name: 生成兼容性报告
       if: always()
       run: |
-        echo "## Compatibility Report" > report.md
-        echo "### Build Status: ${{ job.status }}" >> report.md
-
+        echo "## OpenWrt 兼容性检测报告" > report.md
+        echo "**编译状态:** ${{ job.status }}" >> report.md
+        echo "**目标平台:** ${{ github.event.inputs.target }}" >> report.md
+        echo "**固件版本:** ${{ github.event.inputs.firmware_version }}" >> report.md
+        
+        # 错误分类
         if grep -q "multiple definition" lede/logs/build.log; then
-          echo "❌ ​**Symbol Conflicts**" >> report.md
+          echo "### ❌ 符号冲突" >> report.md
           grep -oP 'multiple definition of \K[^ ]+' lede/logs/build.log | sort -u >> report.md
         fi
 
         if grep -q "No such file" lede/logs/build.log; then
-          echo "❌ ​**Missing Files**" >> report.md
+          echo "### ❌ 缺失文件" >> report.md
           grep -oP "No such file.*'\K[^']+" lede/logs/build.log | sort -u >> report.md
         fi
 
         if [ ${{ job.status }} == 'success' ]; then
-          echo "✅ ​**Validation Passed**" >> report.md
-          echo "Generated IPK: $(ls lede/bin/packages/*/luci/luci-app-macfilter*.ipk)" >> report.md
+          echo "### ✅ 验证通过" >> report.md
+          echo "生成 IPK 文件路径:" >> report.md
+          find lede/bin/packages -name 'luci-app-macfilter*.ipk' | sed 's/^/- `&`/' >> report.md
         fi
 
-    # ================== 结果处理 ==================
-    - name: Upload artifacts
+    # ================== 产出归档 ==================
+    - name: 上传编译产物
       uses: actions/upload-artifact@v4
       with:
-        name: build-report
+        name: openwrt-plugin-artifacts
         path: |
           lede/logs/build.log
           report.md
