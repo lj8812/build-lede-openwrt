@@ -91,18 +91,29 @@ jobs:
     # ================== 编译环境配置 ==================
     - name: 配置 Ubuntu 编译环境
       run: |
-        sudo apt update
-        sudo apt install -y software-properties-common
-        sudo add-apt-repository universe -y
-        sudo add-apt-repository multiverse -y
-        sudo apt update
-        
-        sudo apt install -y \
+        # 配置非交互模式
+        echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/99forceyes
+        echo 'APT::Get::AllowUnauthenticated "true";' | sudo tee -a /etc/apt/apt.conf.d/99forceyes
+        export DEBIAN_FRONTEND=noninteractive
+
+        # 安装仓库管理工具
+        sudo apt-get install -y software-properties-common
+
+        # 启用必要仓库（幂等操作）
+        for repo in universe multiverse; do
+          if ! grep -q "^deb.*$repo" /etc/apt/sources.list; then
+            sudo add-apt-repository $repo -y
+          fi
+        done
+
+        # 更新并安装依赖
+        sudo apt-get update -y
+        sudo apt-get install -y \
           build-essential clang flex g++ gawk \
           gcc-multilib gettext git libncurses-dev \
           libssl-dev python3-dev python3-lib2to3 \
-          rsync unzip zlib1g-dev libdeflate0-dev \
-          ccache ecj fastjar file java-propose-classpath
+          rsync unzip zlib1g-dev libdeflate-dev \
+          ccache ecj fastjar file
 
         # 配置 Python 软链接
         sudo ln -sf /usr/bin/python3 /usr/bin/python
