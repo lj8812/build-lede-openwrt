@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      PLUGIN_PATH: "package/network/services/luci-app-macfilter"
+      PLUGIN_PATH: "network/services/luci-app-macfilter"
 
     steps:
     # ================== 源码准备 ==================
@@ -30,7 +30,6 @@ jobs:
     # ================== 冲突预检 ==================
     - name: Pre-check conflicts
       run: |
-        # 1. 文件结构验证
         REQUIRED_FILES=(
           "plugin/luasrc/controller/macfilter.lua"
           "plugin/root/etc/init.d/macfilter"
@@ -42,20 +41,25 @@ jobs:
           fi
         done
 
-        # 2. Makefile 基础语法检查
+        if ! grep -q '^include .*/rules\.mk' plugin/Makefile; then
+          echo "::error::Makefile missing include rules.mk"
+          exit 1
+        fi
         if ! grep -q '^LUCI_DEPENDS' plugin/Makefile; then
-          echo "::error::Makefile missing LUCI_DEPENDS definition"
+          echo "::error::Makefile missing LUCI_DEPENDS"
+          exit 1
+        fi
+        if ! grep -q '^LUCI_TITLE' plugin/Makefile; then
+          echo "::error::Makefile missing LUCI_TITLE"
           exit 1
         fi
 
     # ================== 注入插件 ==================
     - name: Integrate plugin
       run: |
-        mkdir -p lede/$PLUGIN_PATH
-        cp -r plugin/* lede/$PLUGIN_PATH/
-
-        # 解决可能的路径大小写问题
-        find lede/$PLUGIN_PATH -type f -exec sed -i 's/\/etc\/config\/MacFilter/\/etc\/config\/macfilter/g' {} +
+        mkdir -p lede/package/$PLUGIN_PATH
+        cp -r plugin/* lede/package/$PLUGIN_PATH/
+        find lede/package/$PLUGIN_PATH -type f -exec sed -i 's/\/etc\/config\/MacFilter/\/etc\/config\/macfilter/g' {} +
 
     # ================== 编译环境 ==================
     - name: Setup build environment
@@ -63,7 +67,18 @@ jobs:
         sudo apt update
         sudo apt install -y \
           build-essential \
+          clang \
+          flex \
+          g++ \
+          gawk \
+          gcc-multilib \
+          gettext \
+          git \
           libncurses5-dev \
+          libssl-dev \
+          python3-distutils \
+          rsync \
+          unzip \
           zlib1g-dev \
           libdeflate-dev
 
@@ -71,22 +86,19 @@ jobs:
     - name: Build plugin
       working-directory: ./lede
       run: |
-        # 初始化编译系统
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         make defconfig
 
-        # 生成编译日志
         mkdir -p logs
         set -o pipefail
 
-        # 关键编译步骤
-        if ! make package/$PLUGIN_PATH/{clean,compile} V=sc -j$(nproc) 2>&1 | tee logs/build.log; then
+        make package/$PLUGIN_PATH/clean || true
+        if ! make package/$PLUGIN_PATH/compile V=sc -j$(nproc) 2>&1 | tee logs/build.log; then
           echo "::error::Build failed with exit code $?"
           exit 1
         fi
 
-        # 验证产出文件
         if [ ! -f bin/packages/*/luci/luci-app-macfilter*.ipk ]; then
           echo "::error::No IPK package generated"
           exit 1
@@ -99,21 +111,19 @@ jobs:
         echo "## Compatibility Report" > report.md
         echo "### Build Status: ${{ job.status }}" >> report.md
 
-        # 错误分类
-        if grep -q "multiple definition" logs/build.log; then
+        if grep -q "multiple definition" lede/logs/build.log; then
           echo "❌ ​**Symbol Conflicts**" >> report.md
-          grep -oP 'multiple definition of \K[^ ]+' logs/build.log | sort -u >> report.md
+          grep -oP 'multiple definition of \K[^ ]+' lede/logs/build.log | sort -u >> report.md
         fi
 
-        if grep -q "No such file" logs/build.log; then
+        if grep -q "No such file" lede/logs/build.log; then
           echo "❌ ​**Missing Files**" >> report.md
-          grep -oP "No such file.*'\K[^']+" logs/build.log | sort -u >> report.md
+          grep -oP "No such file.*'\K[^']+" lede/logs/build.log | sort -u >> report.md
         fi
 
-        # 成功时输出验证
         if [ ${{ job.status }} == 'success' ]; then
           echo "✅ ​**Validation Passed**" >> report.md
-          echo "Generated IPK: $(ls bin/packages/*/luci/luci-app-macfilter*.ipk)" >> report.md
+          echo "Generated IPK: $(ls lede/bin/packages/*/luci/luci-app-macfilter*.ipk)" >> report.md
         fi
 
     # ================== 结果处理 ==================
