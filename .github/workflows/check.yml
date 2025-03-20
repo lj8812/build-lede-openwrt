@@ -91,60 +91,43 @@ jobs:
     # ================== 编译环境配置 ==================
     - name: 配置 Ubuntu 编译环境
       run: |
-        # 配置非交互模式
-        echo 'APT::Get::Assume-Yes "true";' | sudo tee /etc/apt/apt.conf.d/99forceyes
-        echo 'APT::Get::AllowUnauthenticated "true";' | sudo tee -a /etc/apt/apt.conf.d/99forceyes
         export DEBIAN_FRONTEND=noninteractive
-
-        # 安装仓库管理工具
-        sudo apt-get install -y software-properties-common
-
-        # 启用必要仓库（幂等操作）
-        for repo in universe multiverse; do
-          if ! grep -q "^deb.*$repo" /etc/apt/sources.list; then
-            sudo add-apt-repository $repo -y
-          fi
-        done
-
-        # 更新并安装依赖
-        sudo apt-get update -y
+        sudo apt-get update
         sudo apt-get install -y \
           build-essential clang flex g++ gawk \
           gcc-multilib gettext git libncurses-dev \
           libssl-dev python3-dev python3-lib2to3 \
           rsync unzip zlib1g-dev libdeflate-dev \
+          libdeflate-tools zlib1g-dev liblzma-dev \
           ccache ecj fastjar file
 
-        # 配置 Python 软链接
-        sudo ln -sf /usr/bin/python3 /usr/bin/python
+    # ================== 预处理步骤 ==================
+    - name: 清理编译缓存
+      working-directory: ./lede
+      run: |
+        make distclean || true
+        rm -rf ./tmp ./feeds ./staging_dir
+        git checkout .config
 
     # ================== 编译执行 ==================
     - name: 执行插件编译
       working-directory: ./lede
       env:
-        CCACHE_DIR: /tmp/ccache
+        FORCE_UNSAFE_CONFIGURE: 1
+        ZLIB_LIBS: "-L/usr/lib/x86_64-linux-gnu -lz"
       run: |
         ./scripts/feeds update -a
         ./scripts/feeds install -a
         make defconfig
-
-        mkdir -p logs
-        set -o pipefail
-
-        # 清理并编译
-        make package/$PLUGIN_PATH/clean || true
-        if ! make package/$PLUGIN_PATH/compile \
-          V=sc \
-          -j$(($(nproc) + 1)) 2>&1 | tee logs/build.log
-        then
-          echo "::error::编译失败，错误码: $?"
-          
-          # 提取关键错误信息
-          ERROR_CONTEXT=$(grep -iB 3 "error:" logs/build.log | tail -n 20)
-          echo "::group::错误上下文"
-          echo "$ERROR_CONTEXT"
-          echo "::endgroup::"
-          
+        
+        # 分步构建基础组件
+        make tools/install -j$(nproc)
+        make toolchain/install -j$(nproc)
+        
+        # 编译插件
+        if ! make package/$PLUGIN_PATH/compile V=sc -j$(nproc); then
+          echo "::error::编译失败关键日志:"
+          grep -B 3 -i "error:" logs/build.log | tail -n 30
           exit 1
         fi
 
